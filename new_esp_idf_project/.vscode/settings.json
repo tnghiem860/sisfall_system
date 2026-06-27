@@ -1,0 +1,13 @@
+{
+    "C_Cpp.default.compileCommands": "${workspaceFolder}\\build\\compile_commands.json",
+    "idf.adapterTargetName": "esp32s3",
+    "idf.buildPath": "${workspaceFolder}\\build",
+    "idf.buildPathWin": "${workspaceFolder}\\build",
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32s3"
+    },
+    "idf.pythonBinPathWin": "D:\\Do_an_1\\.espressif\\python_env\\idf5.5_py3.12_env\\Scripts\\python.exe",
+    "idf.toolsPathWin": "D:\\Do_an_1\\.espressif",
+    "idf.espIdfPathWin": "D:\\Do_an_1\\esp-idf-v5.5.1",
+    "idf.flashType": "UART"
+}

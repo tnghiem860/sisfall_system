@@ -1,0 +1,35 @@
+{
+  "configurations": [
+    {
+      "name": "New ESP-IDF Project (ESP32-S3)",
+      "compilerPath": "D:\\Do_an_1\\.espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32s3-elf-gcc.exe",
+      "compileCommands": "D:/Do_an_1/fall_detection_system-main/new_esp_idf_project/build/compile_commands.json",
+      "intelliSenseMode": "windows-gcc-x64",
+      "includePath": [
+        "D:/Do_an_1/fall_detection_system-main/new_esp_idf_project/**"
+      ],
+      "browse": {
+        "path": [
+          "D:/Do_an_1/fall_detection_system-main/new_esp_idf_project"
+        ],
+        "limitSymbolsToIncludedHeaders": true
+      }
+    },
+    {
+      "name": "Fall Detection (ESP32)",
+      "compilerPath": "D:\\Do_an_1\\.espressif\\tools\\xtensa-esp-elf\\esp-14.2.0_20241119\\xtensa-esp-elf\\bin\\xtensa-esp32-elf-gcc.exe",
+      "compileCommands": "D:/Do_an_1/fall_detection_system-main/fall_detection_system-main/build/compile_commands.json",
+      "intelliSenseMode": "windows-gcc-x64",
+      "includePath": [
+        "D:/Do_an_1/fall_detection_system-main/fall_detection_system-main/**"
+      ],
+      "browse": {
+        "path": [
+          "D:/Do_an_1/fall_detection_system-main/fall_detection_system-main"
+        ],
+        "limitSymbolsToIncludedHeaders": true
+      }
+    }
+  ],
+  "version": 4
+}

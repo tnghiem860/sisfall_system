@@ -1,0 +1,2 @@
+# Set the target before building if needed:
+# idf.py set-target esp32s3

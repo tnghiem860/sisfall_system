@@ -1,0 +1,25 @@
+{
+  "cmake.sourceDirectory": "D:/Do_an_1/fall_detection_system-main/new_esp_idf_project",
+  "C_Cpp.intelliSenseEngine": "default",
+  "C_Cpp.default.compileCommands": "D:/Do_an_1/fall_detection_system-main/new_esp_idf_project/build/compile_commands.json",
+  "idf.extensionActivationMode": "always",
+  "idf.openOcdConfigs": [
+    "board/esp32-wrover-kit-3.3v.cfg"
+  ],
+  "idf.portWin": "COM3",
+  "idf.currentSetup": "D:\\Do_an_1\\esp-idf-v5.5.1",
+  "idf.espIdfPathWin": "D:\\Do_an_1\\esp-idf-v5.5.1",
+  "idf.toolsPathWin": "D:\\Do_an_1\\.espressif",
+  "idf.pythonBinPathWin": "D:\\Do_an_1\\.espressif\\python_env\\idf5.5_py3.12_env\\Scripts\\python.exe",
+  "idf.buildPath": "D:\\Do_an_1\\fall_detection_system-main\\new_esp_idf_project\\build",
+  "idf.buildPathWin": "D:\\Do_an_1\\fall_detection_system-main\\new_esp_idf_project\\build",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=D:\\Do_an_1\\fall_detection_system-main\\new_esp_idf_project\\build"
+  ],
+  "idf.flashType": "UART"
+}
