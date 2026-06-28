@@ -591,7 +591,7 @@ static void fall_detection_task(void *arg)
             // Nạp vào ring buffer (đổi trục khớp dataset)
             xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
             ring_buf[ring_head][0] = imu->ay_g;
-            ring_buf[ring_head][1] = -imu->ax_g;
+            ring_buf[ring_head][1] = imu->ax_g;
             ring_buf[ring_head][2] = imu->az_g;
             ring_head = (ring_head + 1) % WINDOW_SIZE;
             if (ring_count < WINDOW_SIZE) ring_count++;

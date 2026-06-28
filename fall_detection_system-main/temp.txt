@@ -1,0 +1,188 @@
+﻿**3.5 THIẾT KẾ PHẦN MỀM**
+
+3.5.1 Lưu đồ thuật toán
+
+**1. Lưu đồ Hoạt động chính (Main System Flow)**
+
+```mermaid
+flowchart TD
+    Start(["Khởi động hệ thống"]) --> Init["Khởi tạo MPU6050, AI Model, SIM/Firebase"]
+    Init --> ConfigWakeup["Cấu hình Wakeup: INT MPU, SOS Button, Timer"]
+    ConfigWakeup --> WaitLoop{"Chờ sự kiện / Sleep"}
+
+    WaitLoop -->|"Ngắt MPU6050"| HandleMPU["Chuyển sang: Khối Tiền xử lý MPU"]
+    WaitLoop -->|"Hàng đợi GPS/MQTT"| ProcessGPS["Cập nhật tọa độ lên Firebase"]
+    WaitLoop -->|"Timer 30p"| ProcessStatus["Báo cáo trạng thái định kỳ"]
+    WaitLoop -->|"Ngắt SOS"| ProcessSOS["Chuyển sang: Lưu đồ Cảnh báo & Hủy"]
+
+    ProcessGPS --> WaitLoop
+    ProcessStatus --> WaitLoop
+    HandleMPU -.-> WaitLoop
+    ProcessSOS -.-> WaitLoop
+```
+
+
+
+Hệ thống được phát triển bằng ngôn ngữ C/C++ trên nền tảng ESP-IDF kết hợp với hệ điều hành thời gia... [TRUNCATED]
+
+
+Sau khi được đọc từ MPU6050, dữ liệu gia tốc ba trục (X, Y, Z) được lưu tạm vào một bộ đệm vòng có k... [TRUNCATED]
+
+3.5.2 Cơ chế phát hiện té ngã bằng mô hình AI
+
+**2. Khối Tiền xử lý Dữ liệu & Bắt ngưỡng Va chạm (Data Collection & Impact Detection)**
+
+```mermaid
+flowchart TD
+    Start(["Ngắt MPU6050"]) --> ReadData["Đọc dữ liệu Gia tốc X, Y, Z"]
+    ReadData --> RingBuffer["Lưu mẫu vào Circular Buffer (150 mẫu)"]
+    RingBuffer --> CalcAM2["Tính độ lớn gia tốc AM² = X² + Y² + Z²"]
+    
+    CalcAM2 --> CheckImpact{"AM² > 2.56g² ?"}
+    
+    CheckImpact -->|"Có (Va chạm)"| PostFallConfig["Đánh dấu sự kiện va chạm<br/>Chuyển trạng thái: Thu thập hậu va chạm"]
+    CheckImpact -->|"Không"| IsImpactDetected{"Đang ở trạng thái<br/>Thu thập hậu va chạm?"}
+    
+    PostFallConfig --> Return["Trở lại Chờ sự kiện"]
+    IsImpactDetected -->|"Không"| Return
+    IsImpactDetected -->|"Có"| NextPhase["Chuyển sang: Khối Suy luận AI"]
+```
+
+
+**3. Khối Chạy Suy luận AI & Đánh giá (Window Extraction & AI Inference)**
+
+```mermaid
+flowchart TD
+    Start(["Chuyển từ Khối Tiền xử lý"]) --> CountSamples{"Đã thu thập đủ<br/>75 mẫu hậu va chạm?"}
+    
+    CountSamples -->|"Chưa đủ"| Return["Trở lại Chờ sự kiện (Tiếp tục lấy mẫu)"]
+    CountSamples -->|"Đủ"| BuildWindow["Trích xuất cửa sổ 150 mẫu<br/>quanh tâm va chạm"]
+    
+    BuildWindow --> AI_Inference["Chạy mô hình AI TFLite (Int8)"]
+    
+    AI_Inference --> CheckAI{"AI đánh giá là Té ngã<br/>(Confidence >= 50%)?"}
+    
+    CheckAI -->|"Không (Bình thường)"| ResetState["Reset trạng thái Va chạm"]
+    ResetState --> Return
+    
+    CheckAI -->|"Có (Té ngã)"| TriggerAlert["Chuyển sang: Lưu đồ Cảnh báo"]
+```
+
+
+
+Việc suy luận mô hình trí tuệ nhân tạo được thực hiện trực tiếp trên vi điều khiển ESP32 thông qua t... [TRUNCATED]
+
+Đầu vào của mô hình là một tensor có kích thước \[1, 150, 3\], tương ứng với một cửa sổ dữ liệu gồm ... [TRUNCATED]
+
+Để hạn chế các cảnh báo sai, hệ thống chỉ xác nhận một sự kiện té ngã khi xác suất của lớp Fall lớn ... [TRUNCATED]
+
+Khác với nhiều hệ thống phát hiện té ngã sử dụng cơ chế xác nhận trên nhiều cửa sổ dữ liệu liên tiếp... [TRUNCATED]
+
+3.5.3 Phương pháp ước tính mức sạc pin (SOC) dựa trên điện áp pin.
+
+Thiết bị đeo sử dụng pin Lithium Polymer (LiPo) 1 cell (1S) dung lượng 2000 mAh với điện áp danh địn... [TRUNCATED]
+
+Mức sạc pin được ước tính dựa trên điện áp đầu cực của pin kết hợp với bảng tra cứu điện áp - dung l... [TRUNCATED]
+
+Do điện áp tối đa của pin LiPo có thể đạt 4,2 V, vượt quá ngưỡng điện áp đầu vào cho phép của bộ chu... [TRUNCATED]
+
+Mạch chia áp gồm hai điện trở có cùng giá trị R1 = R2 = 10 kΩ được mắc nối tiếp giữa cực dương của pin và GND. Điện áp đưa vào ADC được xác định theo công thức:
+
+VADC​=VBAT​×R1​+R2​R2​​
+
+Với R1 = R2​, ta có:
+
+VADC​=VBAT​×21​
+
+Do đó điện áp pin thực được xác định theo công thức:
+
+VBAT​=2×VADC​
+
+Dòng điện tiêu thụ liên tục qua mạch chia áp tại điện áp pin lớn nhất 4,2 V:
+
+I=R1​+R2​VBAT​​ =10000+100004.2​≈210μA
+
+Giá trị dòng điện này rất nhỏ so với dung lượng pin 2000 mAh nên ảnh hưởng không đáng kể đến thời gian hoạt động của thiết bị.
+
+Quá trình ước tính SOC được thực hiện theo ba bước:
+
+Ở bước đầu tiên, để giảm nhiễu phát sinh từ mạch nguồn, mạch tăng áp và sai số ngẫu nhiên của ADC, hệ thống thực hiện lấy nhiều mẫu ADC liên tiếp và tính giá trị trung bình:
+
+ADC‾=1N∑i=1NADCi\\overline{ADC} = \\frac{1}{N} \\sum\_{i=1}^{N} ADC_iADC=N1​i=1∑N​ADCi​
+
+Trong đó N=64:
+
+Ở bước thứ hai, giá trị ADC trung bình được hiệu chuẩn bằng thư viện ADC Calibration Driver của ESP-... [TRUNCATED]
+
+Ở bước thứ ba, điện áp pin được ánh xạ sang mức SOC thông qua bảng tra cứu Voltage - SOC. Bảng này đ... [TRUNCATED]
+
+SOC=SOCi+1​+Vi​−Vi+1​VBAT​−Vi+1​​×(SOCi​−SOCi+1​)
+
+Trong đó:
+
+Vi,Vi+1V*i, V*{i+1}Vi​,Vi+1​ là hai mức điện áp liền kề trong bảng tra cứu.
+
+SOCi,SOCi+1SOC*i, SOC*{i+1}SOCi​,SOCi+1​ là phần trăm dung lượng tương ứng với hai mức điện áp đó.
+
+Chức năng giám sát pin được triển khai dưới dạng một tác vụ FreeRTOS độc lập với chu kỳ cập nhật 60 ... [TRUNCATED]
+
+Giá trị SOC sau khi tính toán được đóng gói cùng các thông tin trạng thái khác của thiết bị, bao gồm... [TRUNCATED]
+
+3.5.4 Cơ chế truyền dữ liệu cảnh báo và vị trí của hệ thống.
+
+**4. Lưu đồ Xử lý Cảnh báo & Hủy báo động (Alert & Cancellation Logic)**
+
+```mermaid
+flowchart TD
+    Start(["AI kết luận Té Ngã / Nhấn SOS"]) --> CheckCooldown{"Đã qua thời gian<br/>Cooldown chưa?"}
+
+    CheckCooldown -->|"Chưa"| Return["Trở lại Chờ sự kiện"]
+    CheckCooldown -->|"Đã qua"| BuzzerCountdown["Đếm ngược còi báo động (5s)"]
+
+    BuzzerCountdown --> CheckCancel{"Người dùng nhấn<br/>nút SOS để hủy?"}
+
+    CheckCancel -->|"Có (Hủy)"| SendCancelEvent["Gửi cập nhật trạng thái: Hủy báo động"]
+    CheckCancel -->|"Không (Bỏ qua)"| FetchGPS["Tiến trình nền: Bật SIM & lấy GPS"]
+    
+    FetchGPS --> PushFirebase["Đẩy cảnh báo lên Firebase"]
+    PushFirebase --> CheckACK{"Chờ 20s xem App<br/>có xác nhận (ACK)?"}
+    
+    CheckACK -->|"Có ACK"| EndAlert["Kết thúc báo động (Tiết kiệm SMS)"]
+    CheckACK -->|"Không ACK / Mất mạng"| SendSMS["Gửi SMS dự phòng kèm tọa độ"]
+    
+    SendCancelEvent --> Return
+    SendSMS --> Return
+    EndAlert --> Return
+```
+
+
+
+Khi hệ thống xác nhận sự kiện té ngã hoặc nhận tín hiệu SOS từ người dùng, ESP32 sẽ kích hoạt quy tr... [TRUNCATED]
+
+ESP32 giao tiếp với module EG800K thông qua giao tiếp UART và sử dụng tập lệnh AT Command để điều kh... [TRUNCATED]
+
+Module EG800K trả về dữ liệu bao gồm trạng thái định vị, vĩ độ (Latitude), kinh độ (Longitude) và th... [TRUNCATED]
+
+Để đảm bảo tính tin cậy của dữ liệu, hệ thống kiểm tra trạng thái định vị trước khi sử dụng tọa độ n... [TRUNCATED]
+
+Sau khi thu thập được dữ liệu vị trí, ESP32 điều khiển module EG800K thiết lập kết nối dữ liệu di độ... [TRUNCATED]
+
+Dữ liệu được lưu trữ dưới dạng một tài liệu trên Firestore, bao gồm các trường thông tin chính được trình bày trong Bảng 3.x.
+
+| **Tên trường** | **Kiểu dữ liệu** | **Mô tả**                                                                      |
+| -------------- | ---------------- | ------------------------------------------------------------------------------ |
+| fall_detected  | Boolean          | Trạng thái phát hiện té ngã của hệ thống (True: có té ngã, False: bình thường) |
+| latitude       | Double           | Vĩ độ hiện tại của người dùng thu được từ bộ thu GNSS                          |
+| longitude      | Double           | Kinh độ hiện tại của người dùng thu được từ bộ thu GNSS                        |
+| timestamp      | String           | Thời điểm ghi nhận sự kiện hoặc cập nhật dữ liệu                               |
+| battery_pct    | Integer          | Mức dung lượng pin còn lại của thiết bị (%)                                    |
+
+Thời gian xảy ra sự kiện được lấy từ đồng hồ thời gian thực của module EG800K, giúp đảm bảo dữ liệu cảnh báo luôn được gắn mốc thời gian chính xác trước khi gửi lên hệ thống lưu trữ.
+
+Sau khi dữ liệu được ghi lên Firestore, ứng dụng Flutter sử dụng cơ chế lắng nghe dữ liệu thời gian ... [TRUNCATED]
+
+Trong một số trường hợp kết nối dữ liệu di động không khả dụng hoặc quá trình gửi dữ liệu lên Firestore thất bại nhiều lần liên tiếp, hệ thống sẽ kích hoạt cơ chế cảnh báo dự phòng bằng tin nhắn SMS.
+
+ESP32 điều khiển module EG800K thông qua các lệnh AT Command để gửi tin nhắn đến số điện thoại của n... [TRUNCATED]
+
+Khi nhận được tin nhắn, người giám hộ có thể mở trực tiếp liên kết Google Maps để xác định vị trí củ... [TRUNCATED]
