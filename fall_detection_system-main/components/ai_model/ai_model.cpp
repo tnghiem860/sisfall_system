@@ -1,6 +1,7 @@
 #include "ai_model.h"
 #include "model_data.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -18,17 +19,23 @@ namespace {
     TfLiteTensor               *input_tensor  = nullptr;
     TfLiteTensor               *output_tensor = nullptr;
 
-    // FIX (arena): Sau khi init thành công, log arena_used_bytes().
-    // Điều chỉnh ARENA_SIZE = arena_used_bytes * 1.2 để có 20% headroom.
-    // Giá trị 100KB là điểm khởi đầu — tăng nếu bị kAllocationFailed.
-    // Đã tăng lên 150KB do model mới có dung lượng 55KB
-    constexpr size_t ARENA_SIZE = 150 * 1024;
-    static uint8_t tensor_arena[ARENA_SIZE];
+    // FIX (dram): Dùng heap thay vì static array để tránh tràn BSS segment.
+    // Model thực tế chỉ dùng ~5KB, đặt 20KB để có headroom an toàn.
+    constexpr size_t ARENA_SIZE = 20 * 1024;
+    static uint8_t *tensor_arena = nullptr;
 }
 
 esp_err_t ai_model_init(void)
 {
     tflite::InitializeTarget();
+
+    if (tensor_arena == nullptr) {
+        tensor_arena = (uint8_t *)heap_caps_malloc(ARENA_SIZE, MALLOC_CAP_8BIT);
+        if (tensor_arena == nullptr) {
+            ESP_LOGE(TAG, "Không cấp được %u bytes cho tensor_arena!", (unsigned)ARENA_SIZE);
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     model = tflite::GetModel(fd_cnn_model);
     if (model->version() != TFLITE_SCHEMA_VERSION) {

@@ -5,4 +5,5 @@ idf_component_register(
         module_sim
         driver
         esp_common
+        nvs_flash
 )

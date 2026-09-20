@@ -25,6 +25,9 @@ extern "C" {
 static const char *TAG = "FALL_MAIN";
 
 // ── Cấu hình ──────────────────────────────────────────────────────
+// Số mặc định: được ghi lên Firebase (devices/{DEVICE_ID}.sms_numbers) nếu chưa
+// có, và dùng làm số dự phòng khi chưa đọc được từ Firebase. Muốn đổi/thêm số
+// thì sửa mảng sms_numbers trên Firebase, không cần nạp lại firmware.
 #define PHONE_NUMBER            "0853344779"
 #define DEVICE_ID               "ESP32_FALL_001"
 #define WINDOW_SIZE             150
@@ -32,11 +35,13 @@ static const char *TAG = "FALL_MAIN";
 #define POST_FALL_SAMPLES       75       // 75 mẫu sau impact (để căn giữa window 150 mẫu)
 // FIX #1: Threshold tính trên ±16g scale — 1.6g² = 2.56 g²
 #define IMPACT_AM2_THRESHOLD    2.56f                   // g² (AM >= 1.6g)
-#define ALERT_COOLDOWN_MS       (30 * 1000)
+#define ALERT_COOLDOWN_MS       0 // Tạm thời vô hiệu hóa (cũ: 30 * 1000)
 #define SOS_BUTTON_GPIO         GPIO_NUM_25
 #define BUZZER_GPIO             GPIO_NUM_13
-// FIX #7: Chu kỳ báo cáo định kỳ (5 phút thay vì 30 phút)
-#define STATUS_REPORT_INTERVAL_MS  (5 * 60 * 1000)
+// FIX #7: Chu kỳ báo cáo định kỳ lên Firebase (2 phút)
+#define STATUS_REPORT_INTERVAL_MS  (2 * 60 * 1000)
+// GPS polling nội bộ mỗi 15 giây (cập nhật s_last_lat/lon, không gửi Firebase)
+#define GPS_POLL_INTERVAL_MS       (15 * 1000)
 
 typedef enum {
     ALERT_REASON_FALL,
@@ -195,6 +200,49 @@ static void battery_task(void* arg) {
     }
 }
 
+// ── Số điện thoại nhận SMS ────────────────────────────────────────
+// s_phones giữ danh sách số dùng gần nhất: khởi tạo bằng PHONE_NUMBER, thay bằng
+// mảng sms_numbers mỗi khi đọc được từ Firebase. Nhiều task cùng đọc/ghi nên
+// bảo vệ bằng spinlock.
+static char         s_phones[SIM_MAX_SMS_NUMBERS][SIM_PHONE_BUF] = { PHONE_NUMBER };
+static int          s_phone_count = 1;
+static portMUX_TYPE s_phone_mux   = portMUX_INITIALIZER_UNLOCKED;
+
+// Lên Firebase lấy danh sách số mới nhất. Lỗi mạng, chưa có field hoặc không có
+// số hợp lệ thì giữ nguyên danh sách đang dùng.
+static phone_status_t phone_refresh(void)
+{
+    char nums[SIM_MAX_SMS_NUMBERS][SIM_PHONE_BUF];
+    int  n = 0;
+    phone_status_t st = sim_firebase_get_sms_numbers(DEVICE_ID, nums, SIM_MAX_SMS_NUMBERS, &n);
+    if (st != PHONE_OK) {
+        ESP_LOGW(TAG, "Không lấy được sms_numbers từ Firebase (status=%d) — dùng danh sách đang lưu", (int)st);
+        return st;
+    }
+    taskENTER_CRITICAL(&s_phone_mux);
+    memcpy(s_phones, nums, sizeof(s_phones));
+    s_phone_count = n;
+    taskEXIT_CRITICAL(&s_phone_mux);
+    ESP_LOGI(TAG, "Danh sách số nhận SMS lấy từ Firebase: %d số", n);
+    return PHONE_OK;
+}
+
+// Gửi cùng một tin nhắn tới mọi số trong danh sách hiện tại.
+static void send_sms_all(const char *msg)
+{
+    char nums[SIM_MAX_SMS_NUMBERS][SIM_PHONE_BUF];
+    int  n;
+    taskENTER_CRITICAL(&s_phone_mux);
+    memcpy(nums, s_phones, sizeof(nums));
+    n = s_phone_count;
+    taskEXIT_CRITICAL(&s_phone_mux);
+
+    for (int i = 0; i < n; i++) {
+        ESP_LOGI(TAG, "Gửi SMS %d/%d (đuôi ...%s)", i + 1, n, nums[i] + strlen(nums[i]) - 3);
+        sim_send_sms(nums[i], msg);
+    }
+}
+
 // ── Task: Lắng nghe lệnh từ App (Firebase Polling) ─────────────
 static void poll_commands_task(void *arg)
 {
@@ -212,23 +260,27 @@ static void poll_commands_task(void *arg)
         buzzer_active = s_buzzer_running;
         taskEXIT_CRITICAL(&s_buzzer_mux);
         
-        // Bỏ qua lấy định vị nếu đang đếm ngược còi
+        // Bỏ qua nếu đang đếm ngược còi
         if (buzzer_active) {
             vTaskDelay(pdMS_TO_TICKS(15000));
             continue;
         }
 
         if (s_emergency_mode) {
-            ESP_LOGW(TAG, "Emergency Mode ON! Lấy vị trí liên tục...");
-            trigger_alert_async("EMERGENCY", 1.0f, ALERT_REASON_EMERGENCY);
-            // Đợi 15 giây trước lần lấy tiếp theo (tần suất khẩn cấp)
+            ESP_LOGW(TAG, "Emergency Mode ON! Gửi trạng thái liên tục (15s/lần)...");
+            // Gửi ngay trạng thái hiện tại (GPS đã được gps_poll_task update mỗi 15s)
+            sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 5.0f, s_battery_pct,
+                                       s_current_fall_state, -1, 1.0f);
+            
+            // Tần suất khẩn cấp: 15 giây gửi 1 lần
             vTaskDelay(pdMS_TO_TICKS(15000));
         } else {
-            // Không khẩn cấp, tiến hành lấy GPS và upload định kỳ
-            ESP_LOGI(TAG, "Đã tới chu kỳ 5 phút, tiến hành lấy GPS...");
-            trigger_alert_async("PERIODIC_5MIN", 0.0f, ALERT_REASON_PERIODIC);
-            // Sau đó ngủ 5 phút
-            vTaskDelay(pdMS_TO_TICKS(5 * 60 * 1000));
+            ESP_LOGI(TAG, "Cập nhật trạng thái định kỳ lên Firebase (2 phút/lần)...");
+            sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 5.0f, s_battery_pct,
+                                       s_current_fall_state, -1, 0.0f);
+            
+            // Ngủ STATUS_REPORT_INTERVAL_MS (hiện tại là 2 phút = 120,000 ms)
+            vTaskDelay(pdMS_TO_TICKS(STATUS_REPORT_INTERVAL_MS));
         }
     }
 }
@@ -403,20 +455,24 @@ static void trigger_alert_async(const char *reason, float confidence, alert_reas
     if (r == ESP_ERR_INVALID_STATE) {
         // GPS task đang chạy rồi — gửi fall event ngay nhưng VẪN GIỮ tọa độ cũ thay vì 0.0
         ESP_LOGW(TAG, "GPS task running, push fall event with last known location");
-        long ts = (long)(xTaskGetTickCount() / configTICK_RATE_HZ);
-        sim_firebase_push_fall_event(DEVICE_ID, s_last_lat, s_last_lon, confidence, s_battery_pct, ts);
-        sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct, 0,
-                                   true, false, confidence, ts);
+        sim_firebase_push_fall_event(DEVICE_ID, s_last_lat, s_last_lon, confidence, s_battery_pct);
+        sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct,
+                                   true, 0, confidence);
     }
 }
 
 // (Đã xóa status_timer_cb vì tích hợp vào poll_commands_task)
 
 // ── Init SIM, Firebase ──────────────────────────────────────────
-static void init_sim_and_firebase(void)
+static bool init_sim_and_firebase(void)
 {
     ESP_ERROR_CHECK(sim_init());
-    ESP_ERROR_CHECK(sim_check_ready());
+    
+    // Thay vì crash (reset), chờ cho đến khi SIM nhận diện được
+    while (sim_check_ready() != ESP_OK) {
+        ESP_LOGE(TAG, "LỖI: Chưa cắm SIM hoặc SIM bị lỗi! Vui lòng cắm SIM. Thử lại sau 5s...");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
 
     // Chờ đăng ký mạng
     for (int i = 0; i < 20; i++) {
@@ -425,9 +481,10 @@ static void init_sim_and_firebase(void)
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
 
-    // Kích hoạt PDP context (GPRS/LTE data)
+    // Kích hoạt PDP context (GPRS/LTE data). sim_firebase_start_pdp() đã tự dò
+    // APN theo nhà mạng và thử hết danh sách APN, nên chỉ cần thử lại 1 lần.
     bool pdp_ok = false;
-    for (int i = 0; i < 5 && !pdp_ok; i++) {
+    for (int i = 0; i < 2 && !pdp_ok; i++) {
         pdp_ok = sim_firebase_start_pdp();
         if (!pdp_ok) {
             ESP_LOGW(TAG, "PDP chưa có IP, thử lại 5s");
@@ -437,6 +494,7 @@ static void init_sim_and_firebase(void)
 
     sim_firebase_init();
     sim_gps_init();
+    return pdp_ok;
 }
 
 // ── Fall detection task (core 1) ──────────────────────────────────
@@ -451,12 +509,15 @@ static void fall_detection_task(void *arg)
     ESP_ERROR_CHECK(mpu6050_init(bus_handle));
     ESP_ERROR_CHECK(ai_model_init());
 
-    init_sim_and_firebase();
-    sim_send_sms(PHONE_NUMBER, "HE THONG DA KHOI DONG!");
-    // Gửi trạng thái khởi động lên Firestore (giữ lat/lon cuối, chưa có té ngã)
+    bool setup_ok = init_sim_and_firebase();
+    if (setup_ok && phone_refresh() == PHONE_ABSENT) {
+        // Document đã có nhưng chưa có sms_numbers -> ghi số mặc định; đã có thì không ghi đè
+        sim_firebase_seed_sms_numbers(DEVICE_ID, PHONE_NUMBER);
+    }
+    // Gửi trạng thái khởi động lên Firestore
     s_current_fall_state = false;
-    sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct, 0, false, true, 0.0f,
-                               (long)(xTaskGetTickCount() / configTICK_RATE_HZ));
+    sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct,
+                               false, -1, 0.0f);
 
     vTaskDelay(pdMS_TO_TICKS(2000));
    // sim_sleep();
@@ -471,6 +532,16 @@ static void fall_detection_task(void *arg)
 
     // Buffer đọc FIFO — tối đa 170 mẫu (1024 byte / 6 byte)
     static mpu6050_data_t fifo_samples[170];
+
+    // Còi kêu 1 lần báo hệ thống sẵn sàng — chỉ khi SIM/PDP đã lên (không gửi SMS lúc setup)
+    if (setup_ok) {
+        ESP_LOGI(TAG, "=== HỆ THỐNG SẴN SÀNG ===");
+        gpio_set_level(BUZZER_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gpio_set_level(BUZZER_GPIO, 0);
+    } else {
+        ESP_LOGW(TAG, "Setup chưa hoàn tất (PDP lỗi) — không bật còi báo sẵn sàng");
+    }
 
     while (1) {
         // ── Vào Light Sleep, thức khi MPU6050 báo FIFO gần đầy ──────
@@ -509,18 +580,19 @@ static void fall_detection_task(void *arg)
             if (gps_alert.reason == ALERT_REASON_FALL || gps_alert.reason == ALERT_REASON_SOS) {
                 s_current_fall_state = true;
                 // Ghi fall event riêng biệt
-                bool fall_ok = sim_firebase_push_fall_event(DEVICE_ID, s_last_lat, s_last_lon, gps_alert.confidence, s_battery_pct, ts);
-                bool status_ok = sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 5.0f, s_battery_pct, 0, true, false, gps_alert.confidence, ts); // ack_fall = false
+                bool fall_ok = sim_firebase_push_fall_event(DEVICE_ID, s_last_lat, s_last_lon, gps_alert.confidence, s_battery_pct);
+                bool status_ok = sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 5.0f, s_battery_pct, true, 0, gps_alert.confidence);
                 
                 if (!fall_ok || !status_ok) {
                     ESP_LOGW(TAG, "Firebase push failed! Sending SMS fallback immediately.");
                     char sms_msg[160];
-                    if (gps_alert.gps.valid) {
-                        snprintf(sms_msg, sizeof(sms_msg), "CANH BAO TE NGA! He thong offline. Vi tri: https://maps.google.com/?q=%.6f,%.6f", s_last_lat, s_last_lon);
+                    if (s_last_lat != 0.0f || s_last_lon != 0.0f) {
+                        snprintf(sms_msg, sizeof(sms_msg), "CANH BAO TE NGA! Vi tri gan nhat: https://maps.google.com/?q=%.6f,%.6f", s_last_lat, s_last_lon);
                     } else {
-                        snprintf(sms_msg, sizeof(sms_msg), "CANH BAO TE NGA! He thong offline. Khong the lay toa do GPS.");
+                        snprintf(sms_msg, sizeof(sms_msg), "CANH BAO TE NGA! Thiet bi mat mang. Vi tri hien tai chua xac dinh.");
                     }
-                    sim_send_sms(PHONE_NUMBER, sms_msg);
+                    // Mạng vừa lỗi nên không thể hỏi Firebase — dùng danh sách đã lấy gần nhất
+                    send_sms_all(sms_msg);
                 } else {
                     ESP_LOGI(TAG, "Firebase push OK. Waiting 20s for App ACK...");
                     // Spawn a tiny task to wait 20s and check ACK without blocking the FIFO
@@ -543,126 +615,111 @@ static void fall_detection_task(void *arg)
                             if (!ack) {
                                 ESP_LOGW(TAG, "No ACK from App after 20s! Sending SMS fallback.");
                                 char sms[160];
-                                if (data->valid) {
-                                    snprintf(sms, sizeof(sms), "CANH BAO TE NGA! App offline. Vi tri: https://maps.google.com/?q=%.6f,%.6f", data->lat, data->lon);
+                                if (data->lat != 0.0f || data->lon != 0.0f) {
+                                    snprintf(sms, sizeof(sms), "CANH BAO TE NGA! Vi tri gan nhat: https://maps.google.com/?q=%.6f,%.6f", data->lat, data->lon);
                                 } else {
-                                    snprintf(sms, sizeof(sms), "CANH BAO TE NGA! App offline. Khong the lay toa do GPS.");
+                                    snprintf(sms, sizeof(sms), "CANH BAO TE NGA! App offline. Vi tri hien tai chua xac dinh.");
                                 }
-                                sim_send_sms(PHONE_NUMBER, sms);
+                                // Mỗi lần báo: lấy danh sách số hiện tại từ Firebase trước khi gửi
+                                phone_refresh();
+                                send_sms_all(sms);
                             } else {
                                 ESP_LOGI(TAG, "App ACKed! Skipping SMS.");
                             }
+                            // Luôn xóa trạng thái té ngã sau khi hết 20s (đã xử lý xong fallback hoặc đã có ACK)
+                            ESP_LOGI(TAG, "Clearing fall state and ack_fall on Firebase.");
+                            s_current_fall_state = false;
+                            sim_firebase_update_status(DEVICE_ID, data->lat, data->lon, 5.0f, s_battery_pct, false, 0, 0.0f);
                             free(data);
                             vTaskDelete(NULL);
-                        }, "sms_fallback", 4096, args, 3, NULL);
+                        }, "sms_fallback", 8192, args, 3, NULL);
                     }
                 }
             } else if (gps_alert.reason == ALERT_REASON_PERIODIC || gps_alert.reason == ALERT_REASON_EMERGENCY || gps_alert.reason == ALERT_REASON_APP_REQUEST) {
                 if (gps_alert.gps.valid) {
-                    // Cập nhật vị trí mới (nếu có fix GPS)
-                    sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 5.0f, s_battery_pct, 0, s_current_fall_state, true, gps_alert.confidence, ts);
+                    sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 5.0f, s_battery_pct, s_current_fall_state, -1, gps_alert.confidence);
                 } else if (gps_alert.reason == ALERT_REASON_PERIODIC) {
-                    // Fallback gửi status ko GPS (giữ tọa độ cũ) cho báo cáo định kỳ
-                    sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct, 0, s_current_fall_state, true, gps_alert.confidence, ts);
+                    sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct, s_current_fall_state, -1, gps_alert.confidence);
                 }
             }
         }
 
         // (Đã xóa s_status_pending xử lý timer, chuyển sang poll_commands_task)
 
-        // ── Đọc hết FIFO ─────────────────────────────────────────────
+        // ── Lấy mẫu (Polling 25Hz giống wireless_test) ─────────────
         mpu6050_clear_interrupt();
-        int n = 0;
-        if (mpu6050_read(&fifo_samples[0]) == ESP_OK) {
-        n = 1;
+        mpu6050_data_t imu_data;
+        if (mpu6050_read(&imu_data) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(40));
+            continue;
         }
 
-        if (n <= 0) {
-        ESP_LOGD(TAG, "Đọc mẫu thất bại — tiếp tục sleep");
-        continue;
+        mpu6050_data_t *imu = &imu_data;
+
+        // Nạp vào ring buffer (đổi trục khớp dataset)
+        xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
+        ring_buf[ring_head][0] = imu->ax_g;
+        ring_buf[ring_head][1] = imu->ay_g;
+        ring_buf[ring_head][2] = imu->az_g;
+        ring_head = (ring_head + 1) % WINDOW_SIZE;
+        if (ring_count < WINDOW_SIZE) ring_count++;
+        xSemaphoreGive(s_ring_mutex);
+
+        float am2 = imu->ax_g * imu->ax_g +
+                    imu->ay_g * imu->ay_g +
+                    imu->az_g * imu->az_g;
+
+        // Kiểm tra buzzer đang chạy không
+        if (active_buzzer_eg != NULL) {
+            EventBits_t bits = xEventGroupGetBits(active_buzzer_eg);
+            if (bits & BUZZER_CANCEL_BIT) {
+                // Người dùng hủy cảnh báo — cập nhật Firestore về bình thường, giữ nguyên tọa độ
+                active_buzzer_eg = NULL;
+                s_current_fall_state = false;
+                sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct, false, -1, 0.0f);
+            } else if (bits & BUZZER_DONE_BIT) {
+                active_buzzer_eg = NULL;
+                trigger_alert_async("FALL DETECTED", s_last_confidence, ALERT_REASON_FALL);
+            }
         }
 
-        ESP_LOGD(TAG, "Đọc %d mẫu từ FIFO", n);
+        // Impact detection
+        if (!impact_detected &&
+            am2 > IMPACT_AM2_THRESHOLD &&
+            ring_count >= POST_FALL_SAMPLES) {
+            impact_detected = true;
+            post_fall_count = 0;
+            ESP_LOGW(TAG, "Impact! AM2=%.3f", am2);
+        }
 
-        // ── Xử lý từng mẫu tuần tự — giống vòng lặp 25Hz cũ ─────────
-        for (int i = 0; i < n; i++) {
-            mpu6050_data_t *imu = &fifo_samples[i];
+        if (impact_detected) {
+            if (++post_fall_count >= POST_FALL_SAMPLES && ring_count >= WINDOW_SIZE) {
+                float window[WINDOW_SIZE][NUM_CHANNELS];
+                build_window(window);
+                impact_detected = false;
 
-            // Nạp vào ring buffer (đổi trục khớp dataset)
-            xSemaphoreTake(s_ring_mutex, portMAX_DELAY);
-            ring_buf[ring_head][0] = imu->ay_g;
-            ring_buf[ring_head][1] = imu->ax_g;
-            ring_buf[ring_head][2] = imu->az_g;
-            ring_head = (ring_head + 1) % WINDOW_SIZE;
-            if (ring_count < WINDOW_SIZE) ring_count++;
-            xSemaphoreGive(s_ring_mutex);
-
-            float am2 = imu->ax_g * imu->ax_g +
-                        imu->ay_g * imu->ay_g +
-                        imu->az_g * imu->az_g;
-
-            // Kiểm tra buzzer đang chạy không
-            if (active_buzzer_eg != NULL) {
-                EventBits_t bits = xEventGroupGetBits(active_buzzer_eg);
-                if (bits & BUZZER_CANCEL_BIT) {
-                    // Người dùng hủy cảnh báo — cập nhật Firestore về bình thường, giữ nguyên tọa độ
-                    active_buzzer_eg = NULL;
-                    s_current_fall_state = false;
-                    long ts = (long)(xTaskGetTickCount() / configTICK_RATE_HZ);
-                    sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct, 0,
-                                               false, true, 0.0f, ts);
-                } else if (bits & BUZZER_DONE_BIT) {
-                    active_buzzer_eg = NULL;
-                    trigger_alert_async("FALL DETECTED", s_last_confidence, ALERT_REASON_FALL);
+                ai_result_t res;
+                if (ai_model_run(window, &res) == ESP_OK) {
+                    ESP_LOGI(TAG, "AI: fall=%d conf=%.3f", res.is_fall, res.confidence);
+                    
+                    if (res.is_fall && res.confidence >= 0.50f) {
+                        TickType_t now = xTaskGetTickCount();
+                        if ((now - last_alert) >= pdMS_TO_TICKS(ALERT_COOLDOWN_MS)) {
+                            last_alert = now;
+                            s_last_confidence = res.confidence;
+                            active_buzzer_eg  = start_buzzer_countdown();
+                        } else {
+                            ESP_LOGW(TAG, "Cooldown chưa hết");
+                        }
+                    } else if (res.is_fall) {
+                        ESP_LOGW(TAG, "Fall detected nhưng confidence %.1f%% < 50%% — bỏ qua",
+                            res.confidence * 100.0f);
+                    }
                 }
             }
-
-            // Impact detection
-            if (!impact_detected &&
-                am2 > IMPACT_AM2_THRESHOLD &&
-                ring_count >= POST_FALL_SAMPLES) {
-                impact_detected = true;
-                post_fall_count = 0;
-                ESP_LOGW(TAG, "Impact! AM2=%.3f", am2);
-            }
-
-            if (!impact_detected) continue;
-            if (++post_fall_count < POST_FALL_SAMPLES) continue;
-
-            if (ring_count < WINDOW_SIZE) {
-                impact_detected = false;
-                continue;
-            }
-
-            float window[WINDOW_SIZE][NUM_CHANNELS];
-            build_window(window);
-            impact_detected = false;
-
-            ai_result_t res;
-            if (ai_model_run(window, &res) != ESP_OK) continue;
-
-            ESP_LOGI(TAG, "AI: fall=%d conf=%.3f", res.is_fall, res.confidence);
-            if (!res.is_fall) continue;
-            if (res.confidence < 0.50f) {
-            ESP_LOGW(TAG, "Fall detected nhưng confidence %.1f%% < 50%% — bỏ qua",
-             res.confidence * 100.0f);
-            continue;
-            }           
-
-            TickType_t now = xTaskGetTickCount();
-            if ((now - last_alert) < pdMS_TO_TICKS(ALERT_COOLDOWN_MS)) {
-                ESP_LOGW(TAG, "Cooldown chưa hết");
-                continue;
-            }
-
-            last_alert = now;
-            s_last_confidence = res.confidence;
-            active_buzzer_eg  = start_buzzer_countdown();
-
-            // Có fall — thoát vòng for, xử lý alert trước
-            // Các mẫu còn lại trong FIFO batch này bỏ qua
-            break;
         }
+        
+        vTaskDelay(pdMS_TO_TICKS(40)); // ~25Hz
     }
 }
 // ── SOS button task (core 0) ──────────────────────────────────────
@@ -723,12 +780,35 @@ static void sos_button_task(void *arg)
         if (cancelled) {
             vTaskDelay(pdMS_TO_TICKS(200));
             s_current_fall_state = false;
-            long ts = (long)(xTaskGetTickCount() / configTICK_RATE_HZ);
-            sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct, 0,
-                                       false, true, 0.0f, ts);
+            sim_firebase_update_status(DEVICE_ID, s_last_lat, s_last_lon, 0.0f, s_battery_pct,
+                                       false, -1, 0.0f);
         } else {
             trigger_alert_async("MANUAL SOS", 1.0f, ALERT_REASON_SOS);
         }
+    }
+}
+
+// ── GPS Poll Task (core 0) ────────────────────────────────────────
+// Lấy GPS mỗi 15 giây, chỉ cập nhật s_last_lat/lon trong bộ nhớ.
+// Firebase được cập nhật định kỳ bởi poll_commands_task (mỗi 2 phút).
+static void gps_poll_task(void *arg)
+{
+    (void)arg;
+
+    // Đợi hệ thống khởi động xong
+    vTaskDelay(pdMS_TO_TICKS(20000));
+
+    while (1) {
+        sim_gps_t gps;
+        esp_err_t err = sim_gps_get_location(&gps, 5000);
+        if (err == ESP_OK && gps.valid) {
+            s_last_lat = (float)gps.lat;
+            s_last_lon = (float)gps.lon;
+            ESP_LOGI("GPS_POLL", "GPS updated: %.6f, %.6f", gps.lat, gps.lon);
+        } else {
+            ESP_LOGD("GPS_POLL", "GPS poll: no fix");
+        }
+        vTaskDelay(pdMS_TO_TICKS(GPS_POLL_INTERVAL_MS));
     }
 }
 
@@ -771,4 +851,8 @@ extern "C" void app_main(void)
     // FIX #5: sos_button_task trên core 0
     xTaskCreatePinnedToCore(sos_button_task, "sos_btn",
                             4096, NULL, 7, NULL, 0);
+
+    // GPS poll task: cập nhật s_last_lat/lon mỗi 15 giây (core 0)
+    xTaskCreatePinnedToCore(gps_poll_task, "gps_poll",
+                            8192, NULL, 3, NULL, 0);
 }
